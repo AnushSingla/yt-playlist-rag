@@ -1,37 +1,39 @@
-import os
 import json
+import os
 import sqlite3
-from tqdm import tqdm
+from dotenv import load_dotenv  # type: ignore
+from fastembed import TextEmbedding  # type: ignore
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
-from fastembed import TextEmbedding
-from dotenv import load_dotenv
+from qdrant_client.models import Distance, PointStruct, VectorParams
+from tqdm import tqdm
 
+# Load environment variables from root .env file
 load_dotenv()
 
-COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "dsa_transcripts")
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+COLLECTION_NAME = "dsa_transcripts"
 TRANSCRIPTS_DIR = "data/transcripts"
-DB_PATH = os.getenv("DB_PATH", "data/pipeline_state.db")
+DB_PATH = "data/pipeline_state.db"
 
 
 class VectorStore:
+
     def __init__(self):
         self.collection_name = COLLECTION_NAME
-        qdrant_url = (os.getenv("QDRANT_URL") or "").strip()
-        qdrant_api_key = (os.getenv("QDRANT_API_KEY") or "").strip()
 
-        # Connect to Qdrant Cloud if credentials are present, else fallback to local storage
+        # 1. Initialize FastEmbed model (lightweight, no PyTorch dependency)
+        # Model dimension for BAAI/bge-small-en-v1.5 is 384
+        self.encoder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+
+        # 2. Check for Cloud Qdrant Environment Variables
+        qdrant_url = os.getenv("QDRANT_URL")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
+
         if qdrant_url and qdrant_api_key:
+            # Production / Cloud setup
             self.qdrant = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
         else:
+            # Local fallback for local development
             self.qdrant = QdrantClient(path="data/qdrant_db")
-
-        # Use fastembed - ONNX-based, no PyTorch needed (~50MB vs ~2GB)
-        self.encoder = TextEmbedding(EMBEDDING_MODEL_NAME)
-
-    def _embed(self, text: str) -> list:
-        return list(self.encoder.embed([text]))[0].tolist()
 
     def create_collection_if_not_exists(self):
         if not self.qdrant.collection_exists(self.collection_name):
@@ -40,9 +42,13 @@ class VectorStore:
                 vectors_config=VectorParams(size=384, distance=Distance.COSINE),
             )
 
+    def encode_text(self, text: str) -> list[float]:
+        """Utility method to encode a single string into a vector list using FastEmbed."""
+        return list(self.encoder.embed([text]))[0].tolist()
+
     def index_transcripts(self):
+        # Reset existing collection before re-indexing
         if self.qdrant.collection_exists(self.collection_name):
-            print(f"Deleting existing collection '{self.collection_name}' for clean sync...")
             self.qdrant.delete_collection(self.collection_name)
 
         self.create_collection_if_not_exists()
@@ -51,18 +57,22 @@ class VectorStore:
         if os.path.exists(DB_PATH):
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
-            video_titles = dict(cursor.execute("SELECT video_id, title FROM videos").fetchall())
+            video_titles = dict(
+                cursor.execute("SELECT video_id, title FROM videos").fetchall()
+            )
             conn.close()
 
         points = []
         point_id = 1
 
         if not os.path.exists(TRANSCRIPTS_DIR):
-            print(f"Directory {TRANSCRIPTS_DIR} not found.")
+            print(f"Directory '{TRANSCRIPTS_DIR}' not found.")
             return
 
-        json_files = [f for f in os.listdir(TRANSCRIPTS_DIR) if f.endswith(".json")]
-        print(f"Indexing {len(json_files)} transcript files using overlapping chunks...")
+        json_files = [
+            f for f in os.listdir(TRANSCRIPTS_DIR) if f.endswith(".json")
+        ]
+        print(f"Indexing {len(json_files)} transcript files...")
 
         for f_name in tqdm(json_files):
             video_id = f_name.replace(".json", "")
@@ -81,32 +91,40 @@ class VectorStore:
                         or []
                     )
 
-                if not isinstance(transcript_data, list) or len(transcript_data) == 0:
+                if not isinstance(transcript_data, list):
                     continue
 
-                CHUNK_SIZE = 6
-                STRIDE = 2
-                num_segs = len(transcript_data)
-
-                for i in range(0, max(1, num_segs), STRIDE):
-                    group = transcript_data[i : min(i + CHUNK_SIZE, num_segs)]
-                    if not group:
-                        continue
-
+                CHUNK_SIZE = 3
+                for i in range(0, len(transcript_data), CHUNK_SIZE):
+                    group = transcript_data[i : i + CHUNK_SIZE]
                     chunk_text = " ".join(
-                        [seg.get("text", "").strip() for seg in group if isinstance(seg, dict)]
+                        [
+                            seg.get("text", "").strip()
+                            for seg in group
+                            if isinstance(seg, dict)
+                        ]
                     ).strip()
 
-                    if not chunk_text or len(chunk_text) < 15:
+                    if not chunk_text:
                         continue
 
-                    raw_start = group[0].get("start", 0) if isinstance(group[0], dict) else 0
+                    # Precise start and end integer timestamp calculation
+                    raw_start = (
+                        group[0].get("start", 0)
+                        if isinstance(group[0], dict)
+                        else 0
+                    )
                     start_time = int(float(raw_start))
 
-                    raw_end = group[-1].get("end", 0) if isinstance(group[-1], dict) else 0
+                    raw_end = (
+                        group[-1].get("end", 0)
+                        if isinstance(group[-1], dict)
+                        else 0
+                    )
                     end_time = int(float(raw_end))
 
-                    vector = self._embed(chunk_text)
+                    # Vector generation with FastEmbed
+                    vector = self.encode_text(chunk_text)
 
                     payload = {
                         "video_id": video_id,
@@ -117,23 +135,31 @@ class VectorStore:
                         "youtube_url": f"https://www.youtube.com/watch?v={video_id}&t={start_time}s",
                     }
 
-                    points.append(PointStruct(id=point_id, vector=vector, payload=payload))
+                    points.append(
+                        PointStruct(
+                            id=point_id, vector=vector, payload=payload
+                        )
+                    )
                     point_id += 1
 
-                    if len(points) >= 300:
-                        self.qdrant.upsert(collection_name=self.collection_name, points=points)
+                    if len(points) >= 500:
+                        self.qdrant.upsert(
+                            collection_name=self.collection_name, points=points
+                        )
                         points = []
-
-                    if i + CHUNK_SIZE >= num_segs:
-                        break
 
             except Exception as e:
                 print(f"\nError processing {f_name}: {e}")
 
         if points:
-            self.qdrant.upsert(collection_name=self.collection_name, points=points)
+            self.qdrant.upsert(
+                collection_name=self.collection_name, points=points
+            )
 
-        print(f"\n[SUCCESS] INDEXING COMPLETE! {point_id - 1} chunks stored in '{self.collection_name}'.")
+        print(f"\n✓ INDEXING COMPLETE! {point_id - 1} chunks stored successfully.")
+        
+        # Safely close Qdrant connection to avoid destructor warnings
+        self.qdrant.close()
 
 
 if __name__ == "__main__":
