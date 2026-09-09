@@ -190,7 +190,7 @@ def api_search(q: str = Query(...)):
             "description": "",
         }
 
-    query_vector = store.encoder.encode(q).tolist()
+    query_vector = store._embed(q)
 
     # Query vector DB for top 25 candidate hits
     response = store.qdrant.query_points(

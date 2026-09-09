@@ -18,3 +18,8 @@ venv/
 
 # Vercel Cache
 .vercel
+
+# Lock files & build config (Vercel must use requirements.txt only)
+uv.lock
+pyproject.toml
+

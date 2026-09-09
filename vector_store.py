@@ -4,13 +4,13 @@ import sqlite3
 from tqdm import tqdm
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from dotenv import load_dotenv
 
 load_dotenv()
 
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "dsa_transcripts")
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 TRANSCRIPTS_DIR = "data/transcripts"
 DB_PATH = os.getenv("DB_PATH", "data/pipeline_state.db")
 
@@ -23,13 +23,15 @@ class VectorStore:
 
         # Connect to Qdrant Cloud if credentials are present, else fallback to local storage
         if qdrant_url and qdrant_api_key:
-            print(f"Connecting to Qdrant Cloud: {qdrant_url[:40]}...")
             self.qdrant = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
         else:
-            print("Connecting to local Qdrant database: data/qdrant_db...")
             self.qdrant = QdrantClient(path="data/qdrant_db")
 
-        self.encoder = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        # Use fastembed - ONNX-based, no PyTorch needed (~50MB vs ~2GB)
+        self.encoder = TextEmbedding(EMBEDDING_MODEL_NAME)
+
+    def _embed(self, text: str) -> list:
+        return list(self.encoder.embed([text]))[0].tolist()
 
     def create_collection_if_not_exists(self):
         if not self.qdrant.collection_exists(self.collection_name):
@@ -98,14 +100,13 @@ class VectorStore:
                     if not chunk_text or len(chunk_text) < 15:
                         continue
 
-                    # Exact start and end integer timestamp calculation
                     raw_start = group[0].get("start", 0) if isinstance(group[0], dict) else 0
                     start_time = int(float(raw_start))
 
                     raw_end = group[-1].get("end", 0) if isinstance(group[-1], dict) else 0
                     end_time = int(float(raw_end))
 
-                    vector = self.encoder.encode(chunk_text).tolist()
+                    vector = self._embed(chunk_text)
 
                     payload = {
                         "video_id": video_id,
@@ -132,7 +133,7 @@ class VectorStore:
         if points:
             self.qdrant.upsert(collection_name=self.collection_name, points=points)
 
-        print(f"\n[SUCCESS] INDEXING COMPLETE! {point_id - 1} overlapping chunks stored in collection '{self.collection_name}'.")
+        print(f"\n[SUCCESS] INDEXING COMPLETE! {point_id - 1} chunks stored in '{self.collection_name}'.")
 
 
 if __name__ == "__main__":
