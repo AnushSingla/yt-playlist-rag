@@ -1,0 +1,20 @@
+# Python Caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Local Data & Media Storage
+data/audio_downloads/
+data/audio_downloads.zip
+data/captions/
+data/qdrant_db/
+data/pipeline_state.db
+
+# Secrets & Environment
+.env
+.venv/
+env/
+venv/
+
+# Vercel Cache
+.vercel
